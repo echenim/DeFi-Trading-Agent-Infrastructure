@@ -1,0 +1,15 @@
+# RPC connection configuration
+
+[ethereum]
+ws_url = "ws://localhost:8545"
+http_url = "http://localhost:8545"
+chain_id = 1
+
+[retry]
+max_retries = 3
+initial_backoff_ms = 100
+max_backoff_ms = 5000
+
+[circuit_breaker]
+failure_threshold = 5
+reset_timeout_secs = 30

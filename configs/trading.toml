@@ -1,0 +1,21 @@
+# Trading parameters configuration
+
+[market_data]
+mempool_buffer_size = 4096
+price_staleness_secs = 30
+
+[strategy]
+min_profit_bps = 50           # Minimum profit in basis points (0.5%)
+max_trade_size_eth = 10.0
+
+[risk]
+max_position_size_eth = 50.0
+max_slippage_bps = 100        # 1%
+max_gas_price_gwei = 200.0
+daily_loss_limit_eth = 5.0
+
+[execution]
+gas_price_multiplier = 1.1
+dry_run = true
+confirmation_blocks = 1
+tx_timeout_secs = 120

@@ -1,0 +1,17 @@
+[package]
+name = "orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common.workspace = true
+messaging.workspace = true
+market-data-agent.workspace = true
+strategy-agent.workspace = true
+risk-agent.workspace = true
+execution-agent.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true

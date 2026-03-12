@@ -1,0 +1,22 @@
+[package]
+name = "market-data-agent"
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "parser_bench"
+harness = false
+
+[dependencies]
+common.workspace = true
+messaging.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
