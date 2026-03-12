@@ -1,211 +1,316 @@
 # Agent-Based DeFi Trading Infrastructure
 
-A modular Rust-based infrastructure for building automated trading
-systems on decentralized finance (DeFi) networks.
+A modular Rust system for automated trading on decentralized finance networks. Four specialized async agents communicate via a broadcast message bus to process Ethereum mempool data, detect arbitrage opportunities, enforce risk constraints, and execute transactions deterministically.
 
-The system ingests blockchain mempool data, detects market
-opportunities, evaluates strategies, enforces risk constraints, and
-executes transactions through a set of specialized asynchronous agents.
+```
+Blockchain Mempool
+        │
+        ▼
+Market Data Agent ── parse pending txs, detect DEX swaps, track prices
+        │
+        ▼
+Strategy Agent ───── evaluate signals, generate trade intents (plugin-based)
+        │
+        ▼
+Risk Agent ────────── validate exposure, slippage, gas, daily loss limits
+        │
+        ▼
+Execution Agent ──── build tx, manage nonce, sign, broadcast (or dry-run)
+        │
+        ▼
+Ethereum Network
+```
 
-Designed for low-latency signal propagation and deterministic
-transaction execution, the architecture enables rapid development and
-testing of arbitrage, liquidation, and yield optimization strategies.
+---
 
-------------------------------------------------------------------------
+## Quick Start
 
-## Overview
+```bash
+# Build
+cargo build --workspace
 
-Modern DeFi markets require infrastructure capable of monitoring large
-volumes of on-chain activity and reacting to opportunities in near
-real-time.
+# Run all tests (95 tests)
+cargo test --workspace
 
-This project implements a **multi-agent trading architecture** where
-each component is responsible for a specific function in the trading
-pipeline.
+# Start in dry-run mode (no real transactions)
+RUST_LOG=info cargo run -p orchestrator -- --config-dir ./configs --dry-run
 
-Core design goals:
+# Run benchmarks
+cargo bench -p messaging -p market-data-agent
+```
 
-- Low-latency event processing
-- Deterministic transaction execution
-- Modular strategy experimentation
-- Resilience to unreliable blockchain RPC infrastructure
-- Clear separation between strategy logic and execution infrastructure
+---
 
-In local testing environments the system processes **\~5K blockchain
-events per second** with **sub-50ms inter-agent communication latency**.
+## Workspace Structure
 
-------------------------------------------------------------------------
+```
+crates/
+  common/             Shared types, messages, config, errors
+  messaging/          Async message bus, circuit breaker, retry with backoff
+  market-data-agent/  Mempool RPC, Uniswap V2/V3 tx parser, price tracker
+  strategy-agent/     Strategy trait + arbitrage strategy plugin
+  risk-agent/         Trade validation rules, exposure tracking
+  execution-agent/    Signing, nonce management, tx building, broadcast
+  orchestrator/       Main binary — spawns all agents as Tokio tasks
 
-## System Architecture
+configs/
+  rpc.toml            RPC connection, retry, circuit breaker settings
+  trading.toml        Strategy thresholds, risk limits, execution params
+```
 
-The system is composed of independent Rust agents communicating through
-an asynchronous messaging layer.
+All agents are library crates. The `orchestrator` is the only binary — it wires agents together in a single Tokio runtime for local development. Agents communicate exclusively through the message bus; no shared state.
 
-    Blockchain Mempool
-            │
-            ▼
-    Market Data Agent
-            │
-            ▼
-    Strategy Agents
-            │
-            ▼
-    Risk Enforcement Agent
-            │
-            ▼
-    Execution Agent
-            │
-            ▼
-    Ethereum Network
+### Crate Dependency Graph
 
-Each agent performs a single responsibility and communicates through
-structured message passing.
+```
+orchestrator → all agent crates → messaging → common
+```
 
-This design allows components to evolve independently while maintaining
-deterministic execution behavior.
+No agent crate depends on another agent crate.
 
-------------------------------------------------------------------------
+---
 
-## Core Components
+## Architecture
+
+### Message Pipeline
+
+Every message flows through a typed enum on a broadcast channel:
+
+```rust
+enum Message {
+    Signal(Envelope<MarketSignal>),      // Market Data → Strategy
+    Intent(Envelope<TradeIntent>),       // Strategy → Risk
+    Validated(Envelope<ValidatedTrade>), // Risk → Execution
+    Executed(Envelope<ExecutionResult>), // Execution → (logging/monitoring)
+}
+```
+
+Each `Envelope<T>` carries a UUID for idempotency and a millisecond timestamp. The bus uses `tokio::sync::broadcast` with configurable capacity (default 4096). Lagging subscribers skip missed messages rather than erroring.
 
 ### Market Data Agent
 
-Consumes real-time blockchain data streams.
+- Subscribes to Ethereum mempool via `RpcClientTrait` (WebSocket)
+- Parses pending transactions for DEX swap calldata:
+  - Uniswap V2: `swapExactTokensForTokens` (`0x38ed1738`), `swapTokensForExactTokens` (`0x8803dbee`)
+  - Uniswap V3: `exactInputSingle` (`0x414bf389`)
+- Tracks prices per `(token_pair, dex)` and detects cross-DEX divergence in basis points
+- Publishes `MarketSignal` (LargeSwap or PriceDivergence) to the bus
 
-Responsibilities:
+### Strategy Agent
 
-- Subscribe to Ethereum mempool via WebSocket RPC
-- Parse pending transactions
-- Track price state across multiple decentralized exchanges
-- Detect potential arbitrage signals
+- Routes incoming `MarketSignal` messages to all registered strategies
+- **Strategy trait**: `fn name()` + `async fn evaluate(&self, signal) -> Option<TradeIntent>`
+- Built-in: `ArbitrageStrategy` — triggers on price divergence above a configurable BPS threshold
+- Extensible: implement `Strategy` to add liquidation, yield, or custom logic
 
-The agent transforms raw blockchain activity into structured market
-signals for strategy evaluation.
+### Risk Agent
 
-------------------------------------------------------------------------
+Validates every `TradeIntent` through a chain of checks before forwarding:
 
-### Strategy Agents
+| Check | Rejects When |
+|-------|-------------|
+| Sanity | Zero amount, zero deadline, same token in/out |
+| Exposure limit | Projected position exceeds `max_position_size_eth` |
+| Slippage | Implied slippage exceeds `max_slippage_bps` |
+| Gas price | `max_gas_price_gwei` on intent exceeds configured limit |
+| Daily loss | Accumulated daily loss exceeds `daily_loss_limit_eth` |
 
-Strategy agents implement trading logic.
-
-Examples include:
-
-- Arbitrage detection
-- Liquidation monitoring
-- Yield optimization
-
-Strategies are implemented as plugins so new trading logic can be
-introduced without modifying core infrastructure.
-
-This significantly reduces experimentation time when developing new
-strategies.
-
-------------------------------------------------------------------------
-
-### Risk Enforcement Agent
-
-Validates trade intents before execution.
-
-Responsibilities include:
-
-- Exposure limit enforcement
-- Slippage validation
-- Transaction sanity checks
-
-This layer prevents unsafe trades from reaching the execution layer
-during volatile market conditions.
-
-------------------------------------------------------------------------
+Passing intents become `ValidatedTrade` with a risk score (weighted: 40% exposure, 30% gas, 30% loss ratio).
 
 ### Execution Agent
 
-Responsible for deterministic blockchain interaction.
+- **NonceManager**: atomic `u64` counter, `sync()` from chain on startup
+- **GasEstimator**: base estimate with configurable multiplier
+- **TransactionBuilder**: deterministic tx construction from `ValidatedTrade`
+- **Signer trait**: `LocalSigner` (key from env) or `MockSigner` for testing
+- **Broadcaster trait**: `DryRunBroadcaster` (logs only) or real broadcast
+- Publishes `ExecutionResult` (Success, Failed, or DryRun) to the bus
 
-Key responsibilities:
+### Resilience
 
-- Transaction construction
-- Nonce management
-- Gas estimation
-- Transaction submission
+- **Circuit breaker** (Closed → Open → HalfOpen) with configurable failure threshold and reset timeout
+- **Exponential backoff retry** with configurable max retries and backoff bounds
+- **CancellationToken** for graceful shutdown — agents drain their inbox before exiting
+- **Idempotency** via UUID message IDs
 
-The execution agent ensures consistent transaction ordering and reliable
-interaction with Ethereum nodes under varying network conditions.
+---
 
-------------------------------------------------------------------------
+## Configuration
 
-## Messaging Layer
+### `configs/rpc.toml`
 
-Agents communicate through an asynchronous messaging layer implemented
-in Rust.
+```toml
+[ethereum]
+ws_url = "ws://localhost:8545"
+http_url = "http://localhost:8545"
+chain_id = 1
 
-Reliability mechanisms include:
+[retry]
+max_retries = 3
+initial_backoff_ms = 100
+max_backoff_ms = 5000
 
-- Idempotency guards
-- Circuit breakers
-- Retry logic for transient failures
+[circuit_breaker]
+failure_threshold = 5
+reset_timeout_secs = 30
+```
 
-These mechanisms ensure reliable coordination even when RPC providers
-behave unpredictably.
+### `configs/trading.toml`
 
-------------------------------------------------------------------------
+```toml
+[market_data]
+mempool_buffer_size = 4096
+price_staleness_secs = 30
 
-## Performance (Local Development)
+[strategy]
+min_profit_bps = 50           # 0.5% minimum profit
+max_trade_size_eth = 10.0
 
-  Metric                          Observed Value
-  ------------------------------- -----------------
-  Event processing throughput     \~5K events/sec
-  Inter-agent latency             \<50ms
-  Signal detection latency        \~2 seconds
-  Failed transaction reduction    \~40%
-  Execution success improvement   \~30%
-  Message delivery reliability    \>95%
+[risk]
+max_position_size_eth = 50.0
+max_slippage_bps = 100        # 1%
+max_gas_price_gwei = 200.0
+daily_loss_limit_eth = 5.0
 
-These results reflect **local development testing**, not production
-blockchain conditions.
+[execution]
+gas_price_multiplier = 1.1
+dry_run = true
+confirmation_blocks = 1
+tx_timeout_secs = 120
+```
 
-------------------------------------------------------------------------
+### Environment Variables
+
+```bash
+PRIVATE_KEY=<hex-encoded-private-key>   # for LocalSigner
+RUST_LOG=info                            # tracing log level
+```
+
+See `.env.example` for a template. **Never commit real private keys.**
+
+---
+
+## Performance
+
+Benchmarked with Criterion on local development hardware:
+
+| Metric | Result |
+|--------|--------|
+| Message bus publish (1 subscriber) | **~40M ops/sec** (~24ns/op) |
+| Message bus publish (4 subscribers) | **~38M ops/sec** (~25ns/op) |
+| Publish → receive roundtrip | **~9.4M ops/sec** (~106ns/op) |
+| Uniswap V2 swap parsing | **~83M ops/sec** (~12ns/op) |
+| Swap selector detection | **~795M ops/sec** (~1.3ns/op) |
+
+Run benchmarks: `cargo bench -p messaging -p market-data-agent`
+
+---
+
+## Testing
+
+**95 tests** across 7 crates covering:
+
+- Message serialization roundtrips
+- Config deserialization from TOML files
+- Circuit breaker state machine transitions
+- Retry backoff behavior
+- Transaction calldata parsing (Uniswap V2/V3)
+- Price divergence detection
+- All 5 risk validation rules (pass + reject cases)
+- Nonce manager concurrency
+- Execution agent dry-run and live modes
+- End-to-end pipeline (market signal → strategy → risk → execution)
+- Graceful shutdown (all agents respond to cancellation within timeout)
+
+```bash
+cargo test --workspace              # all tests
+cargo test -p risk-agent            # single crate
+cargo clippy --workspace            # lint (0 warnings)
+```
+
+---
 
 ## Technology Stack
 
-- Rust
-- Tokio async runtime
-- Ethereum WebSocket RPC
-- JSON-RPC
-- Async message passing
-- Ethereum transaction execution
+| Component | Choice |
+|-----------|--------|
+| Language | Rust (Edition 2024) |
+| Async runtime | Tokio (full features) |
+| Message passing | `tokio::sync::broadcast` |
+| Serialization | serde + serde_json |
+| Configuration | TOML (serde-based) |
+| Observability | tracing + tracing-subscriber |
+| Error handling | thiserror |
+| Benchmarking | Criterion |
+| Shutdown | tokio-util CancellationToken |
 
-------------------------------------------------------------------------
+Blockchain integration uses trait abstractions (`RpcClientTrait`, `Signer`, `Broadcaster`) — swap in production implementations (e.g., `alloy`) without changing agent logic.
 
-## Design Principles
+---
 
-**Single Responsibility Agents**\
-Each component performs one function, reducing coupling and simplifying
-debugging.
+## Production Readiness
 
-**Deterministic Execution**\
-Transaction handling is deterministic to ensure consistent state
-transitions.
+| Layer | Status |
+|-------|--------|
+| Message bus & resilience | Production-ready |
+| Risk validation engine | Production-ready |
+| Transaction parser | Production-ready (Uniswap V2/V3) |
+| Price tracking & divergence | Production-ready |
+| Nonce management | Production-ready |
+| Config & observability | Production-ready |
+| RPC integration | Interface defined, mock implemented |
+| Transaction signing | Interface defined, mock implemented |
+| Transaction broadcast | Interface defined, dry-run implemented |
+| Strategy plugins | Arbitrage implemented, extensible |
 
-**Strategy Isolation**\
-Trading logic exists as plugins separate from core infrastructure.
+To connect to a real Ethereum node: implement `RpcClientTrait` with `alloy` WebSocket provider, `Signer` with `alloy-signer`, and `Broadcaster` with `alloy` transaction sending.
 
-**Resilience to RPC Instability**\
-Circuit breakers and retry mechanisms protect the system from unreliable
-blockchain nodes.
+---
 
-------------------------------------------------------------------------
+## Extending
 
-## Future Improvements
+### Add a new strategy
 
-Possible extensions include:
+```rust
+use async_trait::async_trait;
+use common::messages::{MarketSignal, TradeIntent};
+use strategy_agent::Strategy;
 
-- Cross-chain strategy support
-- Persistent backtesting engine
+pub struct MyStrategy { /* config */ }
+
+#[async_trait]
+impl Strategy for MyStrategy {
+    fn name(&self) -> &str { "my_strategy" }
+
+    async fn evaluate(&self, signal: &MarketSignal) -> Option<TradeIntent> {
+        // Your logic here
+        None
+    }
+}
+```
+
+Register it in the orchestrator's strategy list.
+
+### Add a new risk rule
+
+Add a `check_*` function in `risk-agent/src/rules.rs` following the existing pattern, then call it from `RiskAgent::validate()`.
+
+---
+
+## Future Work
+
+- Real WebSocket RPC integration (alloy)
+- ECDSA transaction signing
+- Live transaction broadcasting
+- Liquidation and yield optimization strategies
+- Persistent nonce recovery from chain
+- HTTP monitoring API
+- Backtesting engine with historical tx replay
 - MEV bundle generation
-- Integration with private relay networks
-- Distributed agent orchestration
+- Cross-chain support
+- Docker/CI pipeline
 
-------------------------------------------------------------------------
+---
 
 ## License
 
